@@ -1,9 +1,35 @@
-.PHONY: deps_table_update modified_only_fixup extra_style_checks quality style fixup fix-copies test test-examples
+.PHONY: deps_table_update modified_only_fixup extra_style_checks quality style style-fast fixup fixup-fast format-only fix-copies test test-examples help
 
 # make sure to test the local checkout in scripts and not the pre-installed one (don't use quotes!)
 export PYTHONPATH = src
 
 check_dirs := examples scripts src tests utils benchmarks
+
+# Help target - show available commands
+help:
+	@echo "📋 Available make targets:"
+	@echo ""
+	@echo "  🎨 Code Formatting (fastest to slowest):"
+	@echo "    make format-only      - Only format code with Ruff (fastest, recommended for daily use)"
+	@echo "    make style-fast       - Format with Ruff, no doc-builder or autogeneration"
+	@echo "    make style            - Full formatting including docs and code generation"
+	@echo "    make modified_only_fixup - Format only modified files"
+	@echo ""
+	@echo "  ✅ Code Quality Checks:"
+	@echo "    make quality          - Run all quality checks without fixing"
+	@echo "    make fixup-fast       - Fast check: format + style (skip repo consistency)"
+	@echo "    make fixup            - Full check: format + style + repo consistency"
+	@echo ""
+	@echo "  🧪 Testing:"
+	@echo "    make test             - Run library tests"
+	@echo "    make test-examples    - Run example tests"
+	@echo ""
+	@echo "  🔧 Other:"
+	@echo "    make fix-copies       - Fix code snippet copies"
+	@echo "    make repo-consistency - Check repository structure"
+	@echo ""
+	@echo "  💡 Tip: Use 'make format-only' for quick formatting before commits!"
+	@echo ""
 
 modified_only_fixup:
 	$(eval modified_py_files := $(shell python utils/get_modified_files.py $(check_dirs)))
@@ -60,9 +86,24 @@ style:
 	${MAKE} autogenerate_code
 	${MAKE} extra_style_checks
 
+# Fast style check - only Ruff formatting (no doc-builder, no autogenerate)
+style-fast:
+	ruff check $(check_dirs) setup.py --fix
+	ruff format $(check_dirs) setup.py
+
+# Format code only - the simplest and fastest option
+format-only:
+	@echo "🎨 Formatting code with Ruff..."
+	@ruff check $(check_dirs) setup.py --fix --quiet || true
+	@ruff format $(check_dirs) setup.py --quiet
+	@echo "✅ Code formatting complete!"
+
 # Super fast fix and check target that only works on relevant modified files since the branch was made
 
 fixup: modified_only_fixup extra_style_checks autogenerate_code repo-consistency
+
+# Fast fixup - skip repo-consistency checks (format + style only)
+fixup-fast: modified_only_fixup extra_style_checks autogenerate_code
 
 # Make marked copies of snippets of codes conform to the original
 

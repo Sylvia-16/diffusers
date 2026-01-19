@@ -1,0 +1,306 @@
+"""
+Stability Analysis Utilities for Video Editing
+
+This module provides functions to identify stable (non-edited) regions in video
+during the inference process, based on x0 prediction history.
+"""
+
+import cv2
+import numpy as np
+import torch
+from scipy import ndimage
+
+
+def refine_mask(mask, kernel_size=3, remove_small_objects=True, min_object_size=50, fill_holes=True):
+    """
+    优化二值mask，使用形态学操作让mask更干净连续
+
+    Args:
+        mask: (H, W) bool or float tensor
+        kernel_size: 形态学操作的kernel大小（默认3，适合小图像）
+        remove_small_objects: 是否移除小的孤立区域（默认True）
+        min_object_size: 最小保留的对象大小（默认50像素）
+        fill_holes: 是否填充空洞（默认True）
+
+    Returns:
+        refined_mask: (H, W) bool tensor (same device as input)
+    """
+    # 记住原始device和dtype
+    if torch.is_tensor(mask):
+        original_device = mask.device
+        mask_np = mask.cpu().numpy().astype(np.uint8)
+    else:
+        original_device = None
+        mask_np = np.array(mask).astype(np.uint8)
+
+    # 确保是二值的 (0 or 1)
+    mask_np = (mask_np > 0.5).astype(np.uint8)
+
+    # 1. 闭运算（先膨胀后腐蚀）：填充小空洞，连接邻近区域
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    mask_closed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
+
+    # 2. 开运算（先腐蚀后膨胀）：去除小噪声点
+    mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel)
+
+    # 3. 移除小的孤立区域
+    if remove_small_objects:
+        # 连通域分析
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_opened, connectivity=8)
+
+        # 保留足够大的区域
+        mask_filtered = np.zeros_like(mask_opened)
+        for i in range(1, num_labels):  # 跳过背景(label 0)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_object_size:
+                mask_filtered[labels == i] = 1
+
+        mask_opened = mask_filtered
+
+    # 4. 填充内部空洞
+    if fill_holes:
+        mask_filled = ndimage.binary_fill_holes(mask_opened).astype(np.uint8)
+    else:
+        mask_filled = mask_opened
+
+    # 转换回torch tensor，并保持在原始device上
+    refined_mask = torch.from_numpy(mask_filled).bool()
+    if original_device is not None:
+        refined_mask = refined_mask.to(original_device)
+
+    return refined_mask
+
+
+def online_stability_check(x0_predictions, current_step, window_start=10, frame_idx=10):
+    """
+    在线稳定性检测：在推理过程中实时评估稳定性（基于方差）
+
+    Args:
+        x0_predictions: list of (B, C, T, H, W) tensors，到目前为止的所有预测
+        current_step: 当前步骤（例如13）
+        window_start: 从哪一步开始计算方差（默认10）
+        frame_idx: 分析哪一帧
+
+    Returns:
+        stability_map: (H, W) 稳定性图，基于 [window_start, current_step] 的方差
+    """
+    if current_step < window_start:
+        raise ValueError(f"current_step ({current_step}) must >= window_start ({window_start})")
+
+    # 提取指定帧
+    x0_predictions_frame = [x[:, :, frame_idx, :, :] for x in x0_predictions]
+
+    # 只使用 window_start 到 current_step 的数据
+    x0_window = x0_predictions_frame[window_start : current_step + 1]
+
+    if len(x0_window) < 2:
+        raise ValueError(f"Need at least 2 steps, got {len(x0_window)}")
+
+    # 计算这个窗口内的方差
+    x0_stack = torch.stack(x0_window, dim=0)  # (N, B, C, H, W)
+    variance = torch.var(x0_stack, dim=0)  # (B, C, H, W)
+    variance = variance.mean(dim=1)[0]  # (H, W) - 平均通道，移除batch
+
+    # 归一化：低方差 = 高稳定性
+    variance_norm = (variance - variance.min()) / (variance.max() - variance.min() + 1e-8)
+    stability_map = 1.0 - variance_norm
+
+    return stability_map
+
+
+def online_cumulative_change(x0_predictions, current_step, window_start=10, frame_idx=10):
+    """
+    在线稳定性检测：使用累积变化量（推荐方法）
+
+    这个方法计算从window_start到current_step之间，每一步的变化累积和。
+    变化小 = 稳定（背景），变化大 = 不稳定（编辑区域）
+
+    Args:
+        x0_predictions: list of (B, C, T, H, W) tensors，到目前为止的所有预测
+        current_step: 当前步骤（例如13）
+        window_start: 从哪一步开始累积变化（默认10）
+        frame_idx: 分析哪一帧
+
+    Returns:
+        stability_map: (H, W) 稳定性图，值越高越稳定
+    """
+    if current_step < window_start + 1:
+        raise ValueError(f"current_step ({current_step}) must > window_start ({window_start})")
+
+    # 提取指定帧
+    x0_predictions_frame = [x[:, :, frame_idx, :, :] for x in x0_predictions]
+
+    # 累积从window_start之后的所有变化
+    cumulative_change = torch.zeros_like(x0_predictions_frame[0][0, 0])  # (H, W)
+
+    for i in range(window_start + 1, current_step + 1):
+        # 计算第i步与第i-1步的差异
+        diff = torch.norm(x0_predictions_frame[i] - x0_predictions_frame[i - 1], dim=1)[0]
+        cumulative_change += diff
+
+    # 归一化：累积变化小 = 稳定
+    change_norm = (cumulative_change - cumulative_change.min()) / (
+        cumulative_change.max() - cumulative_change.min() + 1e-8
+    )
+    stability_map = 1.0 - change_norm
+
+    return stability_map
+
+
+def online_stability_mask(
+    x0_predictions, current_step, window_start=10, frame_idx=10, threshold=0.5, return_stats=False, method="cumulative"
+):
+    """
+    在线稳定性检测（返回二值mask）- 适合直接用于推理
+
+    Args:
+        x0_predictions: list of (B, C, T, H, W) tensors
+        current_step: 当前步骤
+        window_start: 从哪一步开始计算
+        frame_idx: 分析哪一帧
+        threshold: 二值化阈值（默认0.5）
+        return_stats: 是否返回统计信息
+        method: 'cumulative' (推荐) 或 'variance'
+
+    Returns:
+        stable_mask: (H, W) bool tensor，True=稳定区域，False=不稳定区域
+        如果 return_stats=True，还返回 dict 包含更多信息
+
+    Example:
+        # 在推理中使用（推荐累积变化方法）
+        stable_mask = online_stability_mask(x0_history[:14], current_step=13, method='cumulative')
+        # 对稳定区域和不稳定区域采用不同策略
+        edited_regions = ~stable_mask  # 不稳定区域 = 可能的编辑区域
+    """
+    # 根据方法选择计算函数
+    if method == "cumulative":
+        stability_map = online_cumulative_change(x0_predictions, current_step, window_start, frame_idx)
+    elif method == "variance":
+        stability_map = online_stability_check(x0_predictions, current_step, window_start, frame_idx)
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'cumulative' or 'variance'")
+
+    stable_mask = stability_map > threshold
+
+    if return_stats:
+        stable_pct = stable_mask.float().mean().item() * 100
+        unstable_pct = 100 - stable_pct
+
+        stats = {
+            "stability_map": stability_map,
+            "stable_mask": stable_mask,
+            "stable_percentage": stable_pct,
+            "unstable_percentage": unstable_pct,
+            "mean_stability": stability_map.mean().item(),
+            "std_stability": stability_map.std().item(),
+            "method": method,
+        }
+        return stable_mask, stats
+
+    return stable_mask
+
+
+def get_selected_tokens(
+    x0_predictions,
+    current_step,
+    window_start=8,
+    threshold=0.9,
+    kernel_size=3,
+    remove_small_objects=True,
+    min_object_size=50,
+    fill_holes=True,
+    method="cumulative",
+    return_stats=False,
+):
+    """
+    在推理过程中识别稳定的tokens（非编辑区域）
+
+    这是一个封装好的函数，用于在pipeline中调用，判断哪些token是非编辑部分。
+    基于x0预测的历史数据，通过在线稳定性分析识别出稳定区域（背景）和编辑区域。
+
+    Args:
+        x0_predictions: list of (B, C, T, H, W) tensors，历史x0预测
+        current_step: int，当前推理步骤
+        window_start: int，从哪一步开始分析（默认8）
+        threshold: float，稳定性阈值（默认0.9，越高越严格）
+        kernel_size: int，形态学操作kernel大小（默认3，对68x90小图像适用）
+        remove_small_objects: bool，是否移除小孤立区域（默认True）
+        min_object_size: int，最小保留对象大小（默认50像素）
+        fill_holes: bool，是否填充空洞（默认True）
+        method: str，'cumulative'（推荐）或'variance'
+        return_stats: bool，是否返回详细统计信息（默认False）
+
+    Returns:
+        stable_masks: list of (H, W) bool tensors，每帧的稳定区域mask
+                     True = 稳定区域（非编辑部分）
+                     False = 不稳定区域（编辑部分）
+        如果 return_stats=True，还返回 list of dict 包含每帧的详细信息
+
+    Usage in Pipeline:
+        # 在推理的某一步（例如step 13），获取稳定区域mask
+        stable_masks = get_stable_tokens_mask(
+            x0_predictions=x0_history[:14],  # 到当前步的所有预测
+            current_step=13,
+            window_start=8,
+            threshold=0.9,
+            kernel_size=3  # 对小图像使用小kernel
+        )
+
+        # 对每一帧应用不同的处理策略
+        for frame_idx, stable_mask in enumerate(stable_masks):
+            # stable_mask: True=背景（稳定），False=编辑区域（不稳定）
+            edited_mask = ~stable_mask  # 编辑区域
+            # 对编辑区域和稳定区域采用不同的guidance策略
+    """
+    if current_step < window_start:
+        raise ValueError(f"current_step ({current_step}) must >= window_start ({window_start})")
+
+    if len(x0_predictions) < current_step + 1:
+        raise ValueError(f"Need at least {current_step + 1} predictions, got {len(x0_predictions)}")
+
+    # 获取帧数
+    num_frames = x0_predictions[0].shape[2]  # T dimension
+
+    # 收集所有帧的稳定区域mask
+    stable_masks = []
+    # all_stats = [] if return_stats else None
+
+    for frame_idx in range(num_frames):
+        # 1. 使用在线稳定性检测获取原始mask
+        stable_mask, stats = online_stability_mask(
+            x0_predictions,
+            current_step=current_step,
+            window_start=window_start,
+            frame_idx=frame_idx,
+            threshold=threshold,
+            return_stats=True,
+            method=method,
+        )
+
+        # 2. 优化mask：去噪、平滑、填充空洞
+        # 注意：online_stability_mask返回的stable_mask是True=稳定
+        # 我们要refine的是编辑区域（~stable_mask），然后再反转回来
+        edited_mask_raw = ~stable_mask
+        edited_mask_refined = refine_mask(
+            edited_mask_raw,
+            kernel_size=kernel_size,
+            remove_small_objects=remove_small_objects,
+            min_object_size=min_object_size,
+            fill_holes=fill_holes,
+        )
+
+        # 反转回稳定区域mask
+        stable_mask_refined = ~edited_mask_refined
+
+        # 保存（必须clone避免引用问题）
+        stable_masks.append(stable_mask_refined.clone())
+
+    for i in range(len(stable_masks)):
+        stable_masks[i] = stable_masks[i].unsqueeze(0)
+    stable_masks = torch.stack(stable_masks, dim=1).float()
+    mask = torch.nn.functional.max_pool2d(stable_masks, kernel_size=2, stride=2)
+    # torch.save(mask, "mask.pt")
+    mask = mask.flatten()
+    selected_tokens = torch.nonzero(mask).flatten()
+
+    return selected_tokens

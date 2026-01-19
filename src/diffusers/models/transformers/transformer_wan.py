@@ -75,6 +75,25 @@ class WanAttnProcessor:
                 "WanAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
             )
 
+    def fuse_cache(
+        self, key: torch.Tensor, value: torch.Tensor, cache_config: Optional[Dict[str, Any]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if cache_config.step < cache_config.init_kv_step:
+            return key, value
+        if cache_config.step == cache_config.init_kv_step or cache_config.step in cache_config.refresh_kv_steps:
+            cache_config.cache_key[cache_config.layer_index] = key
+            cache_config.cache_value[cache_config.layer_index] = value
+            return key, value
+        selected_tokens = cache_config.selected_tokens
+        if key.shape[1] != selected_tokens.shape[0]:
+            key = key[:, selected_tokens]
+            value = value[:, selected_tokens]
+        cache_config.cache_key[cache_config.layer_index][:, selected_tokens] = key
+        cache_config.cache_value[cache_config.layer_index][:, selected_tokens] = value
+        key = cache_config.cache_key[cache_config.layer_index]
+        value = cache_config.cache_value[cache_config.layer_index]
+        return key, value
+
     def __call__(
         self,
         attn: "WanAttention",
@@ -82,6 +101,7 @@ class WanAttnProcessor:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_config: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -103,19 +123,24 @@ class WanAttnProcessor:
 
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
-                freqs_cos: torch.Tensor,
-                freqs_sin: torch.Tensor,
+                cache_config: Optional[Dict[str, Any]] = None,
+                freqs_cos: Optional[torch.Tensor] = None,
+                freqs_sin: Optional[torch.Tensor] = None,
             ):
                 x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
                 cos = freqs_cos[..., 0::2]
                 sin = freqs_sin[..., 1::2]
+                if cache_config is not None and hidden_states.shape[1] != freqs_cos.shape[1]:
+                    cos = cos[:, cache_config.selected_tokens]
+                    sin = sin[:, cache_config.selected_tokens]
                 out = torch.empty_like(hidden_states)
                 out[..., 0::2] = x1 * cos - x2 * sin
                 out[..., 1::2] = x1 * sin + x2 * cos
+
                 return out.type_as(hidden_states)
 
-            query = apply_rotary_emb(query, *rotary_emb)
-            key = apply_rotary_emb(key, *rotary_emb)
+            query = apply_rotary_emb(query, cache_config, *rotary_emb)
+            key = apply_rotary_emb(key, cache_config, *rotary_emb)
 
         # I2V task
         hidden_states_img = None
@@ -139,6 +164,8 @@ class WanAttnProcessor:
             )
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
+        if cache_config is not None:
+            key, value = self.fuse_cache(key, value, cache_config)
 
         hidden_states = dispatch_attention_fn(
             query,
@@ -148,8 +175,7 @@ class WanAttnProcessor:
             dropout_p=0.0,
             is_causal=False,
             backend=self._attention_backend,
-            # Reference: https://github.com/huggingface/diffusers/pull/12909
-            parallel_config=(self._parallel_config if encoder_hidden_states is None else None),
+            parallel_config=self._parallel_config,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -273,9 +299,12 @@ class WanAttention(torch.nn.Module, AttentionModuleMixin):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        return self.processor(self, hidden_states, encoder_hidden_states, attention_mask, rotary_emb, **kwargs)
+        return self.processor(
+            self, hidden_states, encoder_hidden_states, attention_mask, rotary_emb, cache_config, **kwargs
+        )
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -462,6 +491,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
+        cache_config: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -483,7 +513,9 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
+
+        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb, cache_config)
+
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
@@ -554,11 +586,9 @@ class WanTransformer3DModel(
         "blocks.0": {
             "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
         },
-        # Reference: https://github.com/huggingface/diffusers/pull/12909
-        # We need to disable the splitting of encoder_hidden_states because the image_encoder
-        # (Wan 2.1 I2V) consistently generates 257 tokens for image_embed. This causes the shape
-        # of encoder_hidden_states—whose token count is always 769 (512 + 257) after concatenation
-        # —to be indivisible by the number of devices in the CP.
+        "blocks.*": {
+            "encoder_hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
+        },
         "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
         "": {
             "timestep": ContextParallelInput(split_dim=1, expected_dims=2, split_output=False),
@@ -614,13 +644,19 @@ class WanTransformer3DModel(
                 for _ in range(num_layers)
             ]
         )
-
         # 4. Output norm & projection
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
         self.gradient_checkpointing = False
+
+    def select_tokens(self, hidden_states: torch.Tensor, cache_config: Dict[str, Any]) -> torch.Tensor:
+        if ((cache_config.step) > cache_config.init_kv_step) and (
+            (cache_config.step) not in cache_config.refresh_kv_steps
+        ):
+            return hidden_states[:, cache_config.selected_tokens]
+        return hidden_states
 
     def forward(
         self,
@@ -630,6 +666,7 @@ class WanTransformer3DModel(
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        cache_config: Optional[Dict[str, Any]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -648,9 +685,6 @@ class WanTransformer3DModel(
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
-        post_patch_num_frames = num_frames // p_t
-        post_patch_height = height // p_h
-        post_patch_width = width // p_w
 
         rotary_emb = self.rope(hidden_states)
 
@@ -676,16 +710,22 @@ class WanTransformer3DModel(
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
-
+        if cache_config is not None:
+            hidden_states = self.select_tokens(hidden_states, cache_config)
+            if timestep_proj.ndim == 4:
+                timestep_proj = self.select_tokens(timestep_proj, cache_config)
+        # print("[select_tokens] hidden_states", hidden_states.shape)
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, cache_config
                 )
         else:
-            for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            for index, block in enumerate(self.blocks):
+                if cache_config is not None:
+                    cache_config.layer_index = index
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, cache_config)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
@@ -703,21 +743,19 @@ class WanTransformer3DModel(
         # on.
         shift = shift.to(hidden_states.device)
         scale = scale.to(hidden_states.device)
+        if cache_config is not None and hidden_states.shape[1] != scale.shape[1]:
+            if shift.shape[1] != 1:
+                shift = shift[:, cache_config.selected_tokens]
+                scale = scale[:, cache_config.selected_tokens]
 
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
-
-        hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
-        )
-        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
-            return (output,)
+            return (hidden_states,)
 
-        return Transformer2DModelOutput(sample=output)
+        return Transformer2DModelOutput(sample=hidden_states)

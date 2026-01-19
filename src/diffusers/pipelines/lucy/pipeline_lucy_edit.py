@@ -17,6 +17,7 @@
 # - Based on pipeline_wan.py, but with supports receiving a condition video appended to the channel dimension.
 
 import html
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import regex as re
@@ -46,6 +47,21 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 if is_ftfy_available():
     import ftfy
+
+
+@dataclass
+class CacheConfig:
+    init_kv_step: int = 10
+    cache_key: Dict[int, torch.Tensor] = None
+    cache_value: Dict[int, torch.Tensor] = None
+    selected_tokens: torch.Tensor = None
+    step: int = 0
+
+    # refresh_kv_steps: List[int] = field(default_factory=lambda: [100, 200, 300, 400, 500])
+    # refresh_kv_steps: List[int] = field(default_factory=lambda: [10, 20, 30, 40, 45])
+    refresh_kv_steps: List[int] = field(default_factory=lambda: [45, 46, 47, 48, 49])
+    refresh_kv_steps: List[int] = field(default_factory=lambda: [30, 45, 46, 47, 48, 49])
+    layer_index: int = 0
 
 
 EXAMPLE_DOC_STRING = """
@@ -417,9 +433,9 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         condition_latents = (condition_latents - latents_mean) * latents_std
 
         # Check shapes
-        assert latents.shape == condition_latents.shape, (
-            f"Latents shape {latents.shape} does not match expected shape {condition_latents.shape}. Please check the input."
-        )
+        assert (
+            latents.shape == condition_latents.shape
+        ), f"Latents shape {latents.shape} does not match expected shape {condition_latents.shape}. Please check the input."
 
         return latents, condition_latents
 
@@ -446,6 +462,29 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
     @property
     def attention_kwargs(self):
         return self._attention_kwargs
+
+    def test_token_selector(self, latents10, condition_latents):
+        # calculate the cosine similarity between latents10 and condition_latents
+
+        #
+        latents10 = latents10.permute(0, 2, 3, 4, 1)
+        latents10 = latents10.reshape(1, 21, 30, 52, -1)
+        condition_latents = condition_latents.permute(0, 2, 3, 4, 1).reshape(1, 21, 30, 52, -1)
+        # 最后一个维度的cosine similarity
+        cosine_similarity = torch.nn.functional.cosine_similarity(latents10, condition_latents, dim=-1)
+        # select the tokens with the similarity > 0.9
+        cosine_similarity = cosine_similarity.flatten()
+        mask = torch.where(cosine_similarity > 0.9, 1, 0)
+        mask = mask.reshape(1, 21, 30, 52)
+        # 把mask的最后两个维度下采样用(2,2)的kernel
+        mask = mask.float()  # max_pool2d需要float类型
+        mask = torch.nn.functional.max_pool2d(mask, kernel_size=2, stride=2)  # (1,21,15,26)
+        mask = mask.flatten()
+        selected_tokens = torch.nonzero(mask == 0).flatten()
+        print("selected_tokens", selected_tokens.shape)
+        self.cache_config.selected_tokens = selected_tokens
+        # self.cache_config.cache_key  = {}
+        # self.cache_config.cache_value  = {}
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -641,11 +680,18 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             boundary_timestep = None
 
+        x0_preds = []
+        last_noise_pred = None
+        self.cache_config = CacheConfig()
+        self.cache_config.cache_key = {}
+        self.cache_config.cache_value = {}
+        # self.cache_config = None
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
-
+                if self.cache_config is not None:
+                    self.cache_config.step = i
                 self._current_timestep = t
 
                 if boundary_timestep is None or t >= boundary_timestep:
@@ -658,7 +704,10 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     current_guidance_scale = guidance_scale_2
 
                 # latent_model_input = latents.to(transformer_dtype)
+                print("latents.shape", latents.shape)
                 latent_model_input = torch.cat([latents, condition_latents], dim=1).to(transformer_dtype)
+                print("latent_model_input.shape", latent_model_input.shape)
+
                 # latent_model_input = torch.cat([latents, latents], dim=1).to(transformer_dtype)
                 if self.config.expand_timesteps:
                     # seq_len: num_latent_frames * latent_height//2 * latent_width//2
@@ -667,6 +716,11 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
                 else:
                     timestep = t.expand(latents.shape[0])
+                batch_size, num_channels, num_frames, height, width = latent_model_input.shape
+                p_t, p_h, p_w = current_model.config.patch_size
+                post_patch_num_frames = num_frames // p_t
+                post_patch_height = height // p_h
+                post_patch_width = width // p_w
 
                 with current_model.cache_context("cond"):
                     noise_pred = current_model(
@@ -675,6 +729,7 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         encoder_hidden_states=prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
+                        cache_config=self.cache_config,
                     )[0]
 
                 if self.do_classifier_free_guidance:
@@ -685,11 +740,39 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             encoder_hidden_states=negative_prompt_embeds,
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
+                            cache_config=self.cache_config,
                         )[0]
                     noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
+                if last_noise_pred is not None and noise_pred.shape[1] != last_noise_pred.shape[1]:
+                    new_noise_pred = last_noise_pred.clone()
+                    new_noise_pred[:, self.cache_config.selected_tokens] = noise_pred
+                    noise_pred = new_noise_pred
+                last_noise_pred = noise_pred.clone()
+
+                noise_pred = noise_pred.reshape(
+                    batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+                )
+                noise_pred = noise_pred.permute(0, 7, 1, 4, 2, 5, 3, 6)
+                noise_pred = noise_pred.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
                 # compute the previous noisy sample x_t -> x_t-1
+                # x0_preds.append(latents - timestep  * noise_pred)
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                # if i == 9:
+                #     latents_9 = latents
+                if i == 10:
+                    x0_preds = latents - t.item() / 1000 * noise_pred
+
+                    #
+                    if self.cache_config is not None:
+                        self.test_token_selector(x0_preds, condition_latents)
+                    # torch.save(x0_preds, f"x0_preds_{i}.pt")
+                #     latents_10 = latents
+                #     torch.save(latents, f"latents_{i}.pt")
+                #     torch.save(condition_latents, f"condition_latents_{i}.pt")
+                #     # exit(0)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -711,6 +794,7 @@ class LucyEditPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         self._current_timestep = None
 
         if not output_type == "latent":
+            # latents=torch.load(f"x0_preds_1.pt")
             latents = latents.to(self.vae.dtype)
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
