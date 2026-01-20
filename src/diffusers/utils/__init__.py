@@ -18,6 +18,7 @@ import os
 from packaging import version
 
 from .. import __version__
+from .cache_config import CacheConfig
 from .constants import (
     CONFIG_NAME,
     DEFAULT_HF_PARALLEL_LOADING_WORKERS,

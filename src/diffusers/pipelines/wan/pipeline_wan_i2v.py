@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import html
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import PIL
@@ -32,7 +31,7 @@ from ...video_processor import VideoProcessor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import WanPipelineOutput
 from .stability_utils import get_selected_tokens as get_selected_tokens_impl
-
+from ...utils.cache_config import CacheConfig
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -46,18 +45,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 if is_ftfy_available():
     import ftfy
 
-
-@dataclass
-class CacheConfig:
-    init_kv_step: int = 10
-    cache_key: Dict[int, torch.Tensor] = None
-    cache_value: Dict[int, torch.Tensor] = None
-    selected_tokens: torch.Tensor = None
-    step: int = 0
-
-    # refresh_kv_steps: List[int] = field(default_factory=lambda: [100])
-    refresh_kv_steps: List[int] = field(default_factory=lambda: [20, 30, 40, 45, 46, 47, 48, 49])
-    layer_index: int = 0
 
 
 EXAMPLE_DOC_STRING = """
@@ -567,6 +554,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         save_x0_index: int = -1,
+        cache_config: Optional[CacheConfig] = None,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -758,9 +746,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
         else:
             boundary_timestep = None
-        self.cache_config = CacheConfig()
-        self.cache_config.cache_key = {}
-        self.cache_config.cache_value = {}
+        self.cache_config = cache_config
         # self.cache_config = None
         x0_pred_list = []
         last_noise_pred = None
