@@ -26,12 +26,13 @@ from ...loaders import WanLoraLoaderMixin
 from ...models import AutoencoderKLWan, WanTransformer3DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
+from ...utils.cache_config import CacheConfig
 from ...utils.torch_utils import randn_tensor
 from ...video_processor import VideoProcessor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import WanPipelineOutput
 from .stability_utils import get_selected_tokens as get_selected_tokens_impl
-from ...utils.cache_config import CacheConfig
+
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -44,7 +45,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 if is_ftfy_available():
     import ftfy
-
 
 
 EXAMPLE_DOC_STRING = """
@@ -747,9 +747,11 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             boundary_timestep = None
         self.cache_config = cache_config
-        # self.cache_config = None
         x0_pred_list = []
         last_noise_pred = None
+        logger.info(
+            f"Starting inference loop: {num_inference_steps} steps, num_frames={num_frames}, height={height}, width={width}"
+        )
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -777,7 +779,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 else:
                     latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
                     timestep = t.expand(latents.shape[0])
-                print("latent_model_input", latent_model_input.shape)
+                logger.debug(f"Step {i}/{len(timesteps)-1}: latent_model_input shape: {latent_model_input.shape}")
                 batch_size, num_channels, num_frames, height, width = latent_model_input.shape
                 p_t, p_h, p_w = current_model.config.patch_size
                 post_patch_num_frames = num_frames // p_t
@@ -835,7 +837,9 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     selected_tokens = self.get_selected_tokens(x0_pred_list, i)
                     if self.cache_config is not None:
                         self.cache_config.selected_tokens = selected_tokens
-                        print("selected_tokens", selected_tokens.shape)
+                        logger.info(
+                            f"Step {i}/{len(timesteps)-1}: Cache update - selected_tokens shape: {selected_tokens.shape}"
+                        )
 
                 # torch.save(x0_pred, f"x0_pred_{i}.pt")
                 if callback_on_step_end is not None:
@@ -857,6 +861,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     xm.mark_step()
 
         self._current_timestep = None
+        logger.info("Inference loop completed. Decoding latents to video...")
 
         if self.config.expand_timesteps:
             latents = (1 - first_frame_mask) * condition + first_frame_mask * latents

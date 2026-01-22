@@ -17,7 +17,6 @@
 # - Based on pipeline_wan.py, but with supports receiving a condition video appended to the channel dimension.
 
 import html
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import regex as re
@@ -25,6 +24,7 @@ import torch
 from PIL import Image
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from ....utils.cache_config import CacheConfig
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...loaders import WanLoraLoaderMixin
 from ...models import AutoencoderKLWan, WanTransformer3DModel
@@ -47,21 +47,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 if is_ftfy_available():
     import ftfy
-
-
-@dataclass
-class CacheConfig:
-    init_kv_step: int = 10
-    cache_key: Dict[int, torch.Tensor] = None
-    cache_value: Dict[int, torch.Tensor] = None
-    selected_tokens: torch.Tensor = None
-    step: int = 0
-
-    # refresh_kv_steps: List[int] = field(default_factory=lambda: [100, 200, 300, 400, 500])
-    # refresh_kv_steps: List[int] = field(default_factory=lambda: [10, 20, 30, 40, 45])
-    refresh_kv_steps: List[int] = field(default_factory=lambda: [45, 46, 47, 48, 49])
-    refresh_kv_steps: List[int] = field(default_factory=lambda: [30, 45, 46, 47, 48, 49])
-    layer_index: int = 0
 
 
 EXAMPLE_DOC_STRING = """

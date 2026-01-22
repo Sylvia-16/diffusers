@@ -714,7 +714,7 @@ class WanTransformer3DModel(
             hidden_states = self.select_tokens(hidden_states, cache_config)
             if timestep_proj.ndim == 4:
                 timestep_proj = self.select_tokens(timestep_proj, cache_config)
-        # print("[select_tokens] hidden_states", hidden_states.shape)
+        logger.info(f"[select_tokens] hidden_states: {hidden_states.shape}")
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
