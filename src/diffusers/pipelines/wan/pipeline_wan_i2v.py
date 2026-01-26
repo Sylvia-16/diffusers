@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import html
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import PIL
@@ -507,21 +508,31 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
     def attention_kwargs(self):
         return self._attention_kwargs
 
-    def get_selected_tokens(self, x0_predictions, current_step, window_start=8, threshold=0.9, kernel_size=3):
+    def get_selected_tokens(
+        self,
+        input_list,
+        current_step,
+        method="cumulative",
+        window_start=8,
+        kernel_size=3,
+        init_kv_step=100,
+        refresh_kv_steps=[100],
+    ):
         """
         在推理过程中识别稳定的tokens（非编辑区域）
 
         """
         return get_selected_tokens_impl(
-            x0_predictions=x0_predictions,
+            input_list=input_list,
             current_step=current_step,
             window_start=window_start,
-            threshold=threshold,
             kernel_size=kernel_size,
-            remove_small_objects=True,
+            remove_small_objects=False,
             min_object_size=50,
             fill_holes=True,
-            method="cumulative",
+            method=method,
+            init_kv_step=init_kv_step,
+            refresh_kv_steps=refresh_kv_steps,
             return_stats=False,
         )
 
@@ -555,6 +566,11 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         max_sequence_length: int = 512,
         save_x0_index: int = -1,
         cache_config: Optional[CacheConfig] = None,
+        save_x0_list: bool = False,
+        save_selected_tokens: bool = False,
+        save_latents: bool = False,
+        save_noise_pred: bool = False,
+        use_velocity_based_stability: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -752,6 +768,12 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         logger.info(
             f"Starting inference loop: {num_inference_steps} steps, num_frames={num_frames}, height={height}, width={width}"
         )
+        total_noise_pred_time = 0
+        # 所有计算的token数量
+        total_computed_tokens = 0
+        # 最大计算的token数量
+        max_computed_tokens = 0
+        velocity_list = []
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -787,6 +809,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 post_patch_width = width // p_w
                 if self.cache_config is not None:
                     self.cache_config.step = i
+                t0 = time.time()
                 with current_model.cache_context("cond"):
                     noise_pred = current_model(
                         hidden_states=latent_model_input,
@@ -797,7 +820,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                         return_dict=False,
                         cache_config=self.cache_config,
                     )[0]
-
+                total_computed_tokens += noise_pred.shape[1]
                 if self.do_classifier_free_guidance:
                     with current_model.cache_context("uncond"):
                         noise_uncond = current_model(
@@ -810,6 +833,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             cache_config=self.cache_config,
                         )[0]
                         noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+                t1 = time.time()
+                total_noise_pred_time += t1 - t0
                 if (
                     self.cache_config is not None
                     and last_noise_pred is not None
@@ -818,25 +843,52 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     new_noise_pred = last_noise_pred.clone()
                     new_noise_pred[:, self.cache_config.selected_tokens] = noise_pred
                     noise_pred = new_noise_pred
+
                 last_noise_pred = noise_pred.clone()
+                # calculate the max computed tokens
+                max_computed_tokens += noise_pred.shape[1]
                 noise_pred = noise_pred.reshape(
                     batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
                 )
+
                 noise_pred = noise_pred.permute(0, 7, 1, 4, 2, 5, 3, 6)
                 noise_pred = noise_pred.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+                velocity_list.append(noise_pred.clone())
+                if save_noise_pred:
+                    torch.save(noise_pred, f"test_noise_pred/noise_pred_{prompt}_{i}.pt")
+                    logger.info(f"Saved noise_pred to test_noise_pred/noise_pred_{prompt}_{i}.pt")
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if save_latents:
+                    torch.save(latents, f"test_latents/latents_{prompt}_{i}.pt")
                 # torch.save(latents, f"test_x0/i2v_latents_{i}.pt")
                 x0_pred = latents - t.item() / 1000 * noise_pred
+                if save_x0_list:
+                    torch.save(x0_pred, f"test_x0/x0_pred_{prompt}_{i}.pt")
+                    logger.info(f"Saved x0_pred to test_x0/x0_pred_{prompt}_{i}.pt")
                 x0_pred_list.append(x0_pred)
                 # if i >= 20:
                 # torch.save(x0_pred, f"test_x0/x0_pred_{i}.pt")
                 if self.cache_config is not None and (
                     i == self.cache_config.init_kv_step or i in self.cache_config.refresh_kv_steps
                 ):
-                    selected_tokens = self.get_selected_tokens(x0_pred_list, i)
+                    if use_velocity_based_stability:
+                        input_list = velocity_list
+                        method = "variance"
+                    else:
+                        input_list = x0_pred_list
+                        method = "cumulative"
+                    selected_tokens = self.get_selected_tokens(
+                        input_list,
+                        current_step=i,
+                        method=method,
+                        refresh_kv_steps=self.cache_config.refresh_kv_steps,
+                        init_kv_step=self.cache_config.init_kv_step,
+                    )
                     if self.cache_config is not None:
                         self.cache_config.selected_tokens = selected_tokens
+                        if save_selected_tokens:
+                            torch.save(selected_tokens, f"test_selected_tokens/selected_tokens_{prompt}_{i}.pt")
                         logger.info(
                             f"Step {i}/{len(timesteps)-1}: Cache update - selected_tokens shape: {selected_tokens.shape}"
                         )
@@ -862,7 +914,10 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         self._current_timestep = None
         logger.info("Inference loop completed. Decoding latents to video...")
-
+        logger.info(f"Total noise prediction time: {total_noise_pred_time}")
+        logger.info(f"Total token ratio: {total_computed_tokens / max_computed_tokens:.4f}")
+        logger.info(f"Total computed tokens: {total_computed_tokens}")
+        logger.info(f"Max computed tokens: {max_computed_tokens}")
         if self.config.expand_timesteps:
             latents = (1 - first_frame_mask) * condition + first_frame_mask * latents
 
@@ -893,25 +948,3 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             return (video,)
 
         return WanPipelineOutput(frames=video)
-
-    def test_token_selector(self, latents, condition_latents):
-        # calculate the cosine similarity between latents10 and condition_latents
-
-        #
-        latents = latents.permute(0, 2, 3, 4, 1)
-        latents = latents.reshape(1, 21, 30, 52, -1)
-        condition_latents = condition_latents.permute(0, 2, 3, 4, 1).reshape(1, 21, 30, 52, -1)
-        # 最后一个维度的cosine similarity
-        cosine_similarity = torch.nn.functional.cosine_similarity(latents, condition_latents, dim=-1)
-        # select the tokens with the similarity > 0.9
-        cosine_similarity = cosine_similarity.flatten()
-        mask = torch.where(cosine_similarity > 0.9, 1, 0)
-        mask = mask.reshape(1, 21, 30, 52)
-        # 把mask的最后两个维度下采样用(2,2)的kernel
-        mask = mask.float()  # max_pool2d需要float类型
-        mask = torch.nn.functional.max_pool2d(mask, kernel_size=2, stride=2)  # (1,21,15,26)
-        mask = mask.flatten()
-        selected_tokens = torch.nonzero(mask == 0).flatten()
-        print("selected_tokens", selected_tokens.shape)
-        self.cache_config.selected_tokens = selected_tokens
-        # self.cache_config.cache_key  = {}

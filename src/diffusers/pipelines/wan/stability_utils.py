@@ -5,6 +5,8 @@ This module provides functions to identify stable (non-edited) regions in video
 during the inference process, based on x0 prediction history.
 """
 
+import logging
+
 import cv2
 import numpy as np
 import torch
@@ -108,6 +110,103 @@ def online_stability_check(x0_predictions, current_step, window_start=10, frame_
     return stability_map
 
 
+def online_direct_cumulative_change(x0_predictions, current_step, window_start=10, frame_idx=10):
+    """
+    在线稳定性检测：使用净变化量
+
+    直接比较 current_step 和 window_start 的差异
+    变化小 = 稳定（背景），变化大 = 不稳定（编辑区域）
+    """
+    if current_step <= window_start:
+        raise ValueError(f"current_step ({current_step}) must > window_start ({window_start})")
+
+    # 提取指定帧
+    x0_predictions_frame = [x[:, :, frame_idx, :, :] for x in x0_predictions]
+
+    # 直接计算净变化（更高效，更符合稳定性定义）
+    net_change = torch.norm(x0_predictions_frame[current_step] - x0_predictions_frame[window_start], dim=1)[
+        0
+    ]  # (H, W)
+
+    # 归一化
+    change_norm = (net_change - net_change.min()) / (net_change.max() - net_change.min() + 1e-8)
+    stability_map = 1.0 - change_norm
+
+    return stability_map
+
+
+def velocity_based_stability(
+    velocity_list,
+    current_step,
+    window_start=10,
+    frame_idx=0,
+    mode="direction_consistency",  # 新: 'average_norm' (norm平均), 'cumulative_norm' (norm累积), 'direction_consistency' (方向一致性, 类似R²)
+    normalize=True,
+):
+    """
+    改进的 velocity 稳定性，融入轨迹方向一致性
+    """
+    if current_step < window_start:
+        raise ValueError(f"current_step ({current_step}) must >= window_start ({window_start})")
+
+    # 提取帧的 velocity 历史: list of (C, H, W)
+    v_predictions_frame = [v[0, :, frame_idx, :, :] for v in velocity_list[window_start : current_step + 1]]
+    num_steps = len(v_predictions_frame)
+    if num_steps < 2:
+        raise ValueError("Need at least 2 steps for multi-step modes")
+
+    if mode == "average_norm":  # 平均 norm（简单，解决单步不准）
+        v_stack = torch.stack(v_predictions_frame, dim=0)  # (N, C, H, W)
+        v_norms = torch.norm(v_stack, dim=1)  # (N, H, W)
+        metric = v_norms.mean(dim=0)  # (H, W)
+
+    elif mode == "cumulative_norm":  # 累积 norm 变化（类似你的cumulative change）
+        cumulative = torch.zeros_like(v_predictions_frame[0][0])  # (H, W)
+        for i in range(1, num_steps):
+            diff_norm = torch.norm(v_predictions_frame[i] - v_predictions_frame[i - 1], dim=0)
+            cumulative += diff_norm
+        metric = cumulative
+
+    elif mode == "direction_consistency":  # 方向一致性（类似R²，直线轨迹=高sim）
+        # 向量化计算所有像素的方向一致性（完全在GPU上）
+        v_stack = torch.stack(v_predictions_frame, dim=0)  # (N, C, H, W)
+        N, C, H, W = v_stack.shape
+
+        # 重塑为 (H*W, N, C) 方便批量计算
+        v_reshaped = v_stack.permute(2, 3, 0, 1).reshape(H * W, N, C)  # (H*W, N, C)
+
+        # 批量计算 cosine similarity (完全向量化，GPU上)
+        # 1. 计算每个向量的 norm: (H*W, N)
+        v_norms = torch.norm(v_reshaped, dim=2, keepdim=True)  # (H*W, N, 1)
+
+        # 2. normalize 避免除零
+        v_normalized = v_reshaped / (v_norms + 1e-8)  # (H*W, N, C)
+
+        # 3. 批量计算 cosine similarity matrix: (H*W, N, C) @ (H*W, C, N) -> (H*W, N, N)
+        sim_matrices = torch.bmm(v_normalized, v_normalized.transpose(1, 2))  # (H*W, N, N)
+
+        # 4. 计算每个像素的平均 similarity (排除对角线)
+        # sim_matrices.sum(dim=(1,2)) 是所有元素和，减去对角线 N 个 1.0
+        consistency_scores = (sim_matrices.sum(dim=(1, 2)) - N) / (N * (N - 1))  # (H*W,)
+
+        # 5. 处理零向量情况（norm接近0的设为1.0表示完全一致）
+        zero_mask = v_norms.squeeze(-1).sum(dim=1) < 1e-6  # (H*W,) 所有步都是零向量
+        consistency_scores[zero_mask] = 1.0
+
+        # 重塑回 (H, W)
+        consistency_map = consistency_scores.reshape(H, W)
+        metric = 1.0 - consistency_map  # 低一致=不稳定（反转，像norm）
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    if normalize:
+        metric = (metric - metric.min()) / (metric.max() - metric.min() + 1e-8)
+
+    stability_map = 1.0 - metric  # 高stability = 稳定
+    return stability_map
+
+
 def online_cumulative_change(x0_predictions, current_step, window_start=10, frame_idx=10):
     """
     在线稳定性检测：使用累积变化量（推荐方法）
@@ -148,13 +247,13 @@ def online_cumulative_change(x0_predictions, current_step, window_start=10, fram
 
 
 def online_stability_mask(
-    x0_predictions, current_step, window_start=10, frame_idx=10, threshold=0.5, return_stats=False, method="cumulative"
+    input_list, current_step, window_start=10, frame_idx=10, threshold=0.5, return_stats=False, method="cumulative"
 ):
     """
     在线稳定性检测（返回二值mask）- 适合直接用于推理
 
     Args:
-        x0_predictions: list of (B, C, T, H, W) tensors
+        input_list: list of (B, C, T, H, W) tensors
         current_step: 当前步骤
         window_start: 从哪一步开始计算
         frame_idx: 分析哪一帧
@@ -174,13 +273,18 @@ def online_stability_mask(
     """
     # 根据方法选择计算函数
     if method == "cumulative":
-        stability_map = online_cumulative_change(x0_predictions, current_step, window_start, frame_idx)
+        # input_list is a list of x0 tensors
+        stability_map = online_cumulative_change(input_list, current_step, window_start, frame_idx)
     elif method == "variance":
-        stability_map = online_stability_check(x0_predictions, current_step, window_start, frame_idx)
+        # input_list is a list of x0 tensors
+        stability_map = online_stability_check(input_list, current_step, window_start, frame_idx)
+    elif method == "velocity":
+        # input_list is a list of velocity tensors
+        stability_map = velocity_based_stability(input_list, current_step, window_start, frame_idx)
     else:
         raise ValueError(f"Unknown method: {method}. Use 'cumulative' or 'variance'")
 
-    stable_mask = stability_map > threshold
+    stable_mask = stability_map > threshold  # True = stable, False = unstable
 
     if return_stats:
         stable_pct = stable_mask.float().mean().item() * 100
@@ -201,15 +305,17 @@ def online_stability_mask(
 
 
 def get_selected_tokens(
-    x0_predictions,
+    input_list,
     current_step,
     window_start=8,
     threshold=0.9,
     kernel_size=3,
-    remove_small_objects=True,
+    remove_small_objects=False,
     min_object_size=50,
     fill_holes=True,
     method="cumulative",
+    refresh_kv_steps=[100],
+    init_kv_step=100,
     return_stats=False,
 ):
     """
@@ -219,7 +325,7 @@ def get_selected_tokens(
     基于x0预测的历史数据，通过在线稳定性分析识别出稳定区域（背景）和编辑区域。
 
     Args:
-        x0_predictions: list of (B, C, T, H, W) tensors，历史x0预测
+        input_list: list of (B, C, T, H, W) tensors，历史x0预测
         current_step: int，当前推理步骤
         window_start: int，从哪一步开始分析（默认8）
         threshold: float，稳定性阈值（默认0.9，越高越严格）
@@ -252,25 +358,39 @@ def get_selected_tokens(
             edited_mask = ~stable_mask  # 编辑区域
             # 对编辑区域和稳定区域采用不同的guidance策略
     """
-    if current_step < window_start:
-        raise ValueError(f"current_step ({current_step}) must >= window_start ({window_start})")
+    # 确定比较起点：如果是 init_kv_step 则使用 window_start，否则使用上一个 refresh_kv_step
+    if current_step == init_kv_step:
+        comparison_start = window_start
+    else:
+        # 找到上一个 refresh_kv_step（最近的且小于 current_step 的）
+        previous_refresh_steps = [step for step in refresh_kv_steps if step < current_step]
+        if previous_refresh_steps:
+            comparison_start = max(previous_refresh_steps)
+        else:
+            # 如果没有找到上一个 refresh_kv_step，使用 window_start 作为备选
+            comparison_start = window_start
+    logging.info(
+        f"[get_selected_tokens] method: {method} comparison_start: {comparison_start} current_step: {current_step} window_start: {window_start}"
+    )
+    if current_step < comparison_start:
+        raise ValueError(f"current_step ({current_step}) must >= comparison_start ({comparison_start})")
 
-    if len(x0_predictions) < current_step + 1:
-        raise ValueError(f"Need at least {current_step + 1} predictions, got {len(x0_predictions)}")
+    if len(input_list) < current_step + 1:
+        raise ValueError(f"Need at least {current_step + 1} predictions, got {len(input_list)}")
 
     # 获取帧数
-    num_frames = x0_predictions[0].shape[2]  # T dimension
+    num_frames = input_list[0].shape[2]  # T dimension
 
     # 收集所有帧的稳定区域mask
-    stable_masks = []
+    edited_masks_list = []
     # all_stats = [] if return_stats else None
 
     for frame_idx in range(num_frames):
-        # 1. 使用在线稳定性检测获取原始mask
+        # 1. 使用在线稳定性检测获取原始mask, stable_mask: True = stable, False = unstable
         stable_mask, stats = online_stability_mask(
-            x0_predictions,
+            input_list,
             current_step=current_step,
-            window_start=window_start,
+            window_start=comparison_start,
             frame_idx=frame_idx,
             threshold=threshold,
             return_stats=True,
@@ -290,17 +410,19 @@ def get_selected_tokens(
         )
 
         # 反转回稳定区域mask
-        stable_mask_refined = ~edited_mask_refined
+        # stable_mask_refined = ~edited_mask_refined
 
         # 保存（必须clone避免引用问题）
-        stable_masks.append(stable_mask_refined.clone())
+        edited_masks_list.append(edited_mask_refined.clone())
 
-    for i in range(len(stable_masks)):
-        stable_masks[i] = stable_masks[i].unsqueeze(0)
-    stable_masks = torch.stack(stable_masks, dim=1).float()
-    mask = torch.nn.functional.max_pool2d(stable_masks, kernel_size=2, stride=2)
-    # torch.save(mask, "mask.pt")
+    for i in range(len(edited_masks_list)):
+        edited_masks_list[i] = edited_masks_list[i].unsqueeze(0)
+    edited_masks = torch.stack(edited_masks_list, dim=1).float()
+    torch.save(edited_masks, f"masks_{current_step}.pt")
+
+    mask = torch.nn.functional.max_pool2d(edited_masks, kernel_size=2, stride=2)
+    # torch.save(mask, f"masks_{current_step}.pt")
     mask = mask.flatten()
-    selected_tokens = torch.nonzero(mask).flatten()
+    selected_tokens = torch.nonzero(mask).flatten()  # True = edited, False = stable
 
     return selected_tokens

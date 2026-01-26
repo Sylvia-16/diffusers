@@ -85,9 +85,9 @@ class WanAttnProcessor:
             cache_config.cache_value[cache_config.layer_index] = value
             return key, value
         selected_tokens = cache_config.selected_tokens
-        if key.shape[1] != selected_tokens.shape[0]:
-            key = key[:, selected_tokens]
-            value = value[:, selected_tokens]
+        # if key.shape[1] != selected_tokens.shape[0]:
+        #     key = key[:, selected_tokens]
+        #     value = value[:, selected_tokens]
         cache_config.cache_key[cache_config.layer_index][:, selected_tokens] = key
         cache_config.cache_value[cache_config.layer_index][:, selected_tokens] = value
         key = cache_config.cache_key[cache_config.layer_index]
