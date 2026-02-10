@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import time
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -166,7 +167,9 @@ class WanAttnProcessor:
             hidden_states_img = hidden_states_img.type_as(query)
         if cache_config is not None:
             key, value = self.fuse_cache(key, value, cache_config)
-
+        print(query.shape, key.shape, value.shape)
+        torch.cuda.synchronize()
+        start_time = time.time()
         hidden_states = dispatch_attention_fn(
             query,
             key,
@@ -176,6 +179,11 @@ class WanAttnProcessor:
             is_causal=False,
             backend=self._attention_backend,
             parallel_config=self._parallel_config,
+        )
+        torch.cuda.synchronize()
+        end_time = time.time()
+        logger.info(
+            f"Attention time: {end_time - start_time} seconds, q:{query.shape[1]},kv : {key.shape[1]}"
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -524,12 +532,14 @@ class WanTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
+        t0 = time.time()
         norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
             hidden_states
         )
         ff_output = self.ffn(norm_hidden_states)
         hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
-
+        t1 = time.time()
+        logger.info(f"Feed-forward time: {t1 - t0} seconds, seqlen: {hidden_states.shape[1]}")
         return hidden_states
 
 
@@ -679,9 +689,7 @@ class WanTransformer3DModel(
             scale_lora_layers(self, lora_scale)
         else:
             if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
-                )
+                logger.warning("Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective.")
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size

@@ -191,7 +191,7 @@ else:
             "StableDiffusionControlNetPAGInpaintPipeline",
             "AnimateDiffPAGPipeline",
             "KolorsPAGPipeline",
-            "HunyuanDiTPAGPipeline",
+            # "HunyuanDiTPAGPipeline",
             "StableDiffusion3PAGPipeline",
             "StableDiffusion3PAGImg2ImgPipeline",
             "StableDiffusionPAGPipeline",
@@ -213,11 +213,11 @@ else:
             "StableDiffusionXLControlNetXSPipeline",
         ]
     )
-    _import_structure["controlnet_hunyuandit"].extend(
-        [
-            "HunyuanDiTControlNetPipeline",
-        ]
-    )
+    # _import_structure["controlnet_hunyuandit"].extend(
+    #     [
+    #         "HunyuanDiTControlNetPipeline",
+    #     ]
+    # )
     _import_structure["controlnet_sd3"].extend(
         [
             "StableDiffusion3ControlNetPipeline",
@@ -238,15 +238,15 @@ else:
         "EasyAnimateControlPipeline",
     ]
     _import_structure["hidream_image"] = ["HiDreamImagePipeline"]
-    _import_structure["hunyuandit"] = ["HunyuanDiTPipeline"]
-    _import_structure["hunyuan_video"] = [
-        "HunyuanVideoPipeline",
-        "HunyuanSkyreelsImageToVideoPipeline",
-        "HunyuanVideoImageToVideoPipeline",
-        "HunyuanVideoFramepackPipeline",
-    ]
-    _import_structure["hunyuan_video1_5"] = ["HunyuanVideo15Pipeline", "HunyuanVideo15ImageToVideoPipeline"]
-    _import_structure["hunyuan_image"] = ["HunyuanImagePipeline", "HunyuanImageRefinerPipeline"]
+    # _import_structure["hunyuandit"] = ["HunyuanDiTPipeline"]
+    # _import_structure["hunyuan_video"] = [
+    #     "HunyuanVideoPipeline",
+    #     "HunyuanSkyreelsImageToVideoPipeline",
+    #     "HunyuanVideoImageToVideoPipeline",
+    #     "HunyuanVideoFramepackPipeline",
+    # ]
+    # _import_structure["hunyuan_video1_5"] = ["HunyuanVideo15Pipeline", "HunyuanVideo15ImageToVideoPipeline"]
+    # _import_structure["hunyuan_image"] = ["HunyuanImagePipeline", "HunyuanImageRefinerPipeline"]
     _import_structure["kandinsky"] = [
         "KandinskyCombinedPipeline",
         "KandinskyImg2ImgCombinedPipeline",
@@ -620,9 +620,10 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             StableDiffusionXLControlNetUnionInpaintPipeline,
             StableDiffusionXLControlNetUnionPipeline,
         )
-        from .controlnet_hunyuandit import (
-            HunyuanDiTControlNetPipeline,
-        )
+
+        # from .controlnet_hunyuandit import (
+        #     HunyuanDiTControlNetPipeline,
+        # )
         from .controlnet_sd3 import StableDiffusion3ControlNetInpaintingPipeline, StableDiffusion3ControlNetPipeline
         from .controlnet_xs import (
             StableDiffusionControlNetXSPipeline,
@@ -681,15 +682,16 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .flux2 import Flux2KleinPipeline, Flux2Pipeline
         from .glm_image import GlmImagePipeline
         from .hidream_image import HiDreamImagePipeline
-        from .hunyuan_image import HunyuanImagePipeline, HunyuanImageRefinerPipeline
-        from .hunyuan_video import (
-            HunyuanSkyreelsImageToVideoPipeline,
-            HunyuanVideoFramepackPipeline,
-            HunyuanVideoImageToVideoPipeline,
-            HunyuanVideoPipeline,
-        )
-        from .hunyuan_video1_5 import HunyuanVideo15ImageToVideoPipeline, HunyuanVideo15Pipeline
-        from .hunyuandit import HunyuanDiTPipeline
+
+        # from .hunyuan_image import HunyuanImagePipeline, HunyuanImageRefinerPipeline
+        # from .hunyuan_video import (
+        #     HunyuanSkyreelsImageToVideoPipeline,
+        #     HunyuanVideoFramepackPipeline,
+        #     HunyuanVideoImageToVideoPipeline,
+        #     HunyuanVideoPipeline,
+        # )
+        # from .hunyuan_video1_5 import HunyuanVideo15ImageToVideoPipeline, HunyuanVideo15Pipeline
+        # from .hunyuandit import HunyuanDiTPipeline
         from .i2vgen_xl import I2VGenXLPipeline
         from .kandinsky import (
             KandinskyCombinedPipeline,
@@ -757,7 +759,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .ovis_image import OvisImagePipeline
         from .pag import (
             AnimateDiffPAGPipeline,
-            HunyuanDiTPAGPipeline,
+            # HunyuanDiTPAGPipeline,
             KolorsPAGPipeline,
             PixArtSigmaPAGPipeline,
             SanaPAGPipeline,

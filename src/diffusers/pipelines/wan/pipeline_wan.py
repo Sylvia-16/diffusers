@@ -589,7 +589,11 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
                 else:
                     timestep = t.expand(latents.shape[0])
-
+                batch_size, num_channels, num_frames, height, width = latent_model_input.shape
+                p_t, p_h, p_w = current_model.config.patch_size
+                post_patch_num_frames = num_frames // p_t
+                post_patch_height = height // p_h
+                post_patch_width = width // p_w
                 with current_model.cache_context("cond"):
                     noise_pred = current_model(
                         hidden_states=latent_model_input,
@@ -609,7 +613,13 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             return_dict=False,
                         )[0]
                     noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
-
+                noise_pred = noise_pred.reshape(
+                    batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+                )
+                noise_pred = noise_pred.permute(0, 7, 1, 4, 2, 5, 3, 6)
+                noise_pred = noise_pred.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+                x0_pred = latents - t.item() / 1000 * noise_pred
+                torch.save(x0_pred, f"test_t2v_x0/x0_pred_{i}.pt")
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 

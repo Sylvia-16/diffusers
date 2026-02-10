@@ -1177,6 +1177,8 @@ class StableDiffusion3ControlNetPipeline(
                     cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
                 # controlnet(s) inference
+                print(f"latent_model_input.shape: {latent_model_input.shape}")
+                
                 control_block_samples = self.controlnet(
                     hidden_states=latent_model_input,
                     timestep=timestep,
@@ -1187,6 +1189,8 @@ class StableDiffusion3ControlNetPipeline(
                     conditioning_scale=cond_scale,
                     return_dict=False,
                 )[0]
+                for i in range(len(control_block_samples)):
+                    print(f"control_block_samples[{i}].shape: {control_block_samples[i].shape}")
 
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
